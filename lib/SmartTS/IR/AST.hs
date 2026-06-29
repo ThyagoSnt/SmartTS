@@ -1,5 +1,7 @@
 module SmartTS.IR.AST where
 
+import qualified Data.Map.Strict as M
+
 data Contract a = Contract {
   contractName :: Name,
   contractStorage :: Storage,
@@ -19,6 +21,7 @@ data MethodDecl a = MethodDecl {
 data MethodKind = Originate
                 | EntryPoint
                 | Private
+                | View
   deriving (Eq, Show)
 
 data FormalParameter = FormalParameter Name Type
@@ -30,6 +33,7 @@ data Type = TInt
           | TBool
           | TUnit
           | TRecord [(Name, Type)]
+          | TFunction Type Type   -- T1 -> T2
   deriving (Eq, Show)
 
 type Name = String
@@ -57,6 +61,9 @@ data Expr a
   | Record  a [(Name, Expr a)]
   | Unit    a
   | Call    a Name [Expr a]
+  | Lambda  a Name Type (Expr a)                          -- (x: T) => body
+  | App     a (Expr a) (Expr a)                           -- f(arg)
+  | Closure a Type Name (Expr a) (M.Map Name TypedExpr)   -- valor de runtime
   deriving (Eq, Show)
 
 -- | Extract the annotation from any expression node.
@@ -83,6 +90,9 @@ exprAnn (Gte a _ _)         = a
 exprAnn (Record a _)        = a
 exprAnn (Unit a)            = a
 exprAnn (Call a _ _)        = a
+exprAnn (Lambda a _ _ _)    = a
+exprAnn (App a _ _)         = a
+exprAnn (Closure a _ _ _ _) = a
 
 type MethodBody a = Stmt a
 
