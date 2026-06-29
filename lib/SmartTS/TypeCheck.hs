@@ -4,7 +4,6 @@ module SmartTS.TypeCheck
   ( typeCheckContract
   ) where
 
-import Control.Monad (when, zipWithM_)
 import Control.Monad.State
 import Data.List (nub)
 import qualified Data.Map.Strict as M
