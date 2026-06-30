@@ -63,7 +63,6 @@ parseType = parseArrowType
 
     parseNonFunType = parseRecordType <|> parsePrimitiveType <|> parens parseType 
     -- parseType para deixar algo como (int -> bool) -> int
-    -- outros 2 para d
     
     parsePrimitiveType :: Parser Type
     parsePrimitiveType =
