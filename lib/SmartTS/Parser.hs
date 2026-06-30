@@ -54,8 +54,17 @@ reserved = symbol
 
 -- Types
 parseType :: Parser Type
-parseType = parseRecordType <|> parsePrimitiveType
+parseType = parseArrowType
   where
+    parseArrowType = do
+      t <- parseNonFunType
+      mrest <- optional (symbol "->" *> parseArrowType)
+      return (maybe t (\r -> TFunction t r) mrest)
+
+    parseNonFunType = parseRecordType <|> parsePrimitiveType <|> parens parseType 
+    -- parseType para deixar algo como (int -> bool) -> int
+    -- outros 2 para d
+    
     parsePrimitiveType :: Parser Type
     parsePrimitiveType =
       (reserved "int" >> return TInt)
@@ -84,7 +93,9 @@ parseExpr = makeExprParser parseTerm operators
 
 operators :: [[Operator Parser ParsedExpr]]
 operators =
-  [ [ Prefix (Not () <$ symbol "!") ]
+  [ [ Prefix (Not () <$ symbol "!")
+    , Prefix (Sub () (CInt () 0) <$ symbol "-")  -- unário negativo
+    ]
   , [ InfixL (Mul () <$ symbol "*")
     , InfixL (Div () <$ symbol "/")
     , InfixL (Mod () <$ symbol "%")
@@ -106,8 +117,13 @@ operators =
 parseTerm :: Parser ParsedExpr
 parseTerm = do
   base <- parseAtomOrStorage
-  fields <- many (symbol "." *> parseName)
-  return (foldl (\e f -> FieldAccess () e f) base fields)
+  e <- foldM (\acc f -> pure (FieldAccess () acc f)) base =<< many (symbol "." *> parseName)
+  foldM applyApp e =<< many (parens (sepBy parseExpr (symbol ",")))
+  where
+    applyApp fn args =
+      case args of
+        [arg] -> pure (App () fn arg)
+        _     -> fail "function application expects exactly one argument"
 
 parseAtomOrStorage :: Parser ParsedExpr
 parseAtomOrStorage =
@@ -116,12 +132,24 @@ parseAtomOrStorage =
 
 parseAtom :: Parser ParsedExpr
 parseAtom =
-  parseUnit
+  (try parseLambda) -- try evita conflito entre parseLambda e parens, ambos iniciam com "("
+    <|> parseUnit
     <|> parseRecordExpr
     <|> parseBool
     <|> parseInt
     <|> parseVarOrCall
     <|> parens parseExpr
+
+parseLambda :: Parser ParsedExpr
+parseLambda = do
+  _ <- symbol "("
+  name <- parseName
+  _ <- symbol ":"
+  typ <- parseType
+  _ <- symbol ")"
+  _ <- symbol "=>"
+  body <- parseExpr
+  return (Lambda () name typ body)
 
 parseStorageExpr :: Parser ParsedExpr
 parseStorageExpr = do
@@ -272,6 +300,8 @@ parseMethodKind =
   (symbol "@originate" >> return Originate)
     <|> (symbol "@entrypoint" >> return EntryPoint)
     <|> (symbol "@private" >> return Private)
+    <|> (symbol "@view" >> return View)
+
 
 -- Formal parameters
 parseFormalParameter :: Parser FormalParameter
@@ -295,6 +325,7 @@ parseMethod = do
   let kind
         | Originate `elem` decorators = Originate
         | EntryPoint `elem` decorators = EntryPoint
+        | View       `elem` decorators = View
         | otherwise = Private
   return $ MethodDecl kind name params returnType body
 
