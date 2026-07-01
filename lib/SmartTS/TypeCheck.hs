@@ -28,6 +28,7 @@ data TcEnv = TcEnv
   , envBindings :: M.Map Name TcBinding
   , envFunctionSignatures :: M.Map Name Signature
   , envReturnType :: Type
+  , envReadOnly :: Bool
   }
   deriving (Eq, Show)
 
@@ -95,6 +96,7 @@ checkMethod c m =
           , envBindings = paramMap
           , envFunctionSignatures = buildSigMap c
           , envReturnType = methodReturnType m
+          , envReadOnly = methodKind m == View
           }
    in case runStateT (checkStmt (methodBody m)) env0 of
         Left err -> Left err
@@ -127,6 +129,9 @@ checkStmt (ValDeclStmt n typ e) = do
   modify $ insertLocal n LocalImmutable typ
   return (ValDeclStmt n typ te)
 checkStmt (AssignmentStmt lv e) = do
+  ro <- gets envReadOnly
+  when (ro && assignsStorage lv) $
+    tcError "Cannot assign to `storage` in a @view method."
   checkAssignable lv
   tl <- typeOfLValue lv
   te <- inferExpr e
@@ -174,6 +179,12 @@ checkAssignable lv = do
           tcError $ "Cannot assign to immutable val `" ++ n ++ "` (or through it for field updates)."
         Just (TcBinding LocalMutable _) -> return ()
     LField {} -> return ()
+
+assignsStorage :: LValue -> Bool
+assignsStorage LStorage = True
+assignsStorage (LField root _) = assignsStorage root
+assignsStorage _ = False
+
 
 rootOf :: LValue -> LValue
 rootOf LStorage    = LStorage
@@ -254,6 +265,26 @@ inferExpr (Call () name args) = do
         targs
         expected
       return (Call (returnType sig) name targs)
+inferExpr (Lambda () param paramTy body) = do
+  tbody <- withSavedEnv $ do
+    noDuplicateLocal param
+    modify $ insertLocal param LocalImmutable paramTy
+    inferExpr body
+  let fnTy = TFunction paramTy (exprAnn tbody)
+  return (Lambda fnTy param paramTy tbody)
+inferExpr (App () fn arg) = do
+  tfn <- inferExpr fn
+  targ <- inferExpr arg
+  case exprAnn tfn of
+    TFunction t1 t2 -> do
+      lift $ expectType "function application argument" (exprAnn targ) t1
+      return (App t2 tfn targ)
+    _ -> tcError $
+      "Expected function type in application, got " ++ prettyType (exprAnn tfn) ++ "."
+inferExpr (Closure _ _ _ _ _) =
+  tcError "Closure values cannot appear in source code."
+
+
 
 inferBoolBin :: (Expr Type -> Expr Type -> Expr Type) -> Expr () -> Expr () -> TcM (Expr Type)
 inferBoolBin con a b = do
@@ -308,6 +339,8 @@ typesEqual TUnit TUnit = True
 typesEqual (TRecord as) (TRecord bs) = length as == length bs && and (zipWith fieldEq as bs)
   where
     fieldEq (n1, t1) (n2, t2) = n1 == n2 && typesEqual t1 t2
+typesEqual (TFunction a1 b1) (TFunction a2 b2) =
+  typesEqual a1 a2 && typesEqual b1 b2
 typesEqual _ _ = False
 
 prettyType :: Type -> String
@@ -322,3 +355,4 @@ prettyType (TRecord fs) =
       , let lastI = length fs - 1
       ]
     ++ "}"
+prettyType (TFunction t1 t2) = prettyType t1 ++ " -> " ++ prettyType t2
