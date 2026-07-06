@@ -29,7 +29,10 @@ evalExpr (Var _ n) = do
       case M.lookup n (rtParams rt) of
         Just v  -> return v
         Nothing -> interpretBug ("unknown variable `" ++ n ++ "` after type check")
-evalExpr (Record ty fields) = do
+evalExpr (Lambda ty param paramTy body) = do
+  rt <- get
+  return (Closure ty paramTy param body (captureEnv rt))
+evalExpr(Record ty fields) = do
   fs <- mapM (\(k, e) -> (,) k <$> evalExpr e) fields
   return (Record ty fs)
 evalExpr (FieldAccess _ base fld) = do
@@ -80,10 +83,19 @@ evalExpr (Call _ name args) = do
   case mRet of
     Nothing -> interpretBug ("method `" ++ name ++ "` did not return a value after type check")
     Just v  -> return v
-
--- ---------------------------------------------------------------------------
--- Statement execution
--- ---------------------------------------------------------------------------
+evalExpr (App _ fn arg) = do
+  fnVal <- evalExpr fn
+  argVal <- evalExpr arg
+  case fnVal of 
+    Closure _ _ param body captured -> do
+      outerRt <- get 
+      let innerRt = outerRt { rtParams = M.insert param argVal captured
+                            , rtLocals = M.empty}
+      (ret, innerRt') <- lift $ runStateT (evalExpr body) innerRt
+      modify $ \r -> r {rtStorage = rtStorage innerRt'}
+      return ret
+    _ -> interpretBug "application target was not a function after type check" 
+evalExpr c@(Closure _ _ _ _ _) = return c
 
 execStmt :: TypedStmt -> EvalM (Maybe TypedExpr)
 execStmt (SequenceStmt ss) = execSequence ss
@@ -225,3 +237,7 @@ boolBin a b op = do
 
 intCmp :: TypedExpr -> TypedExpr -> (Int -> Int -> Bool) -> EvalM TypedExpr
 intCmp a b op = CBool TBool <$> (op <$> evalInt a <*> evalInt b)
+
+captureEnv :: Runtime -> M.Map Name TypedExpr
+captureEnv rt = 
+  M.union (fmap bindingValue (rtLocals rt)) (rtParams rt)
