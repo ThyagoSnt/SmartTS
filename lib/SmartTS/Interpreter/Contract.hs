@@ -6,7 +6,7 @@
 -- internal bugs ("interpretBug") rather than user-facing "Left" errors.
 module SmartTS.Interpreter.Contract where
 
-import Control.Monad.State (runStateT)
+import Control.Monad.State (runStateT, MonadState (get))
 import Data.Aeson (Value (..))
 import qualified Data.Map.Strict as M
 import SmartTS.IR.AST
@@ -112,3 +112,31 @@ callEntrypointWithJsonArgs repo c addr entryName sourceText argsJson = do
       let ci'   = ci {instanceStorage = newStorage}
           repo' = M.insert addr ci' repo
       Right (ret, repo')
+
+findViewByName :: TypedContract -> Name -> Either String (MethodDecl Type)
+findViewByName c name = 
+  case filter (\m -> methodKind m == View && methodName m == name) (contractMethods c ) of
+    [] -> Left $ "No @view named \"" ++ name ++ "\"."
+    [m] -> Right m
+    _ ->  Left $ "Multiple @view methods named \"" ++ name ++ "\"."
+
+callViewWithJsonArgs :: RepositoryState -> TypedContract -> Address -> Name -> String -> Value -> Either String (Maybe TypedExpr, RepositoryState)
+callViewWithJsonArgs repo c addr viewName sourceText argsJson = do
+  ci <-
+    case M.lookup addr repo of
+      Nothing -> Left $ "Unknown address: " ++ addr
+      Just x  -> Right x
+  assertAddressMatchesSource addr sourceText
+  if instanceContractName ci /= contractName c
+    then
+      Left $
+        "Contract name mismatch: instance is "
+          ++ instanceContractName ci
+          ++ " but loaded source is "
+          ++ contractName c
+          ++ "."
+    else do
+      m          <- findViewByName c viewName
+      params     <- bindArgsByName (methodArgs m) argsJson
+      (ret, _rt') <- execMethodWithInitialStorage c (instanceStorage ci) m params
+      Right (ret, repo)
