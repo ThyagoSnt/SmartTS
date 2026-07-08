@@ -7,7 +7,16 @@ import Test.Tasty.HUnit
 import SmartTS.IR.AST
 import SmartTS.Parser
 import Data.Aeson (object, (.=))
-import SmartTS.Interpreter (ContractInstance (..), contractInstanceFromStorageValue)
+import SmartTS.CodeGen.CompileLLTZ (translateExpression, translateType)
+import SmartTS.Interpreter
+  ( ContractInstance (..)
+  , callViewWithJsonArgs
+  , contractInstanceFromStorageValue
+  , execMethodWithInitialStorage
+  , findEntryPointByName
+  , originateWithJsonArgs
+  )
+import qualified SmartTS.IR.LLTZ as LLTZ
 import SmartTS.TypeCheck (typeCheckContract)
 
 main :: IO ()
@@ -27,6 +36,8 @@ tests =
         , errorTests
         ]
     , typeCheckTests
+    , interpreterTests
+    , codeGenTests
     ]
 
 -- Helper function to parse and assert success
@@ -56,6 +67,21 @@ typeCheckFailure input = case parseContractFromString input of
     case typeCheckContract c of
       Left _  -> return ()
       Right _ -> assertFailure "Expected type error but checking succeeded"
+
+parseAndTypeCheck :: String -> Either String TypedContract
+parseAndTypeCheck input = do
+  parsed <- either (Left . show) Right (parseContractFromString input)
+  typeCheckContract parsed
+
+runEntrypointReturn :: String -> Name -> TypedExpr -> Either String TypedExpr
+runEntrypointReturn input entrypoint initialStorage = do
+  contract <- parseAndTypeCheck input
+  method <- findEntryPointByName contract entrypoint
+  (maybeRet, _) <-
+    execMethodWithInitialStorage contract initialStorage method mempty
+  case maybeRet of
+    Nothing -> Left $ "Entrypoint `" ++ entrypoint ++ "` did not return a value."
+    Just value -> Right value
 
 contractTests :: TestTree
 contractTests = testGroup "Contract Parsing"
@@ -125,6 +151,13 @@ methodTests = testGroup "Method Parsing"
           Contract _ _ [MethodDecl Private "helper" [] TInt _] ->
             return ()
           _ -> assertFailure "Expected @private method"
+
+  , testCase "Method with @view decorator" $
+      parseSuccess "contract Test { storage: { x: int }; @view getX(): int { return storage.x; } }" $ \contract ->
+        case contract of
+          Contract _ _ [MethodDecl View "getX" [] TInt _] ->
+            return ()
+          _ -> assertFailure $ "Expected @view method, got: " ++ show contract
 
   , testCase "Method with parameters" $
       parseSuccess "contract Test { storage: { x: int }; @entrypoint add(a: int, b: int): int { return a + b; } }" $ \contract ->
@@ -297,6 +330,18 @@ expressionTests = testGroup "Expression Parsing"
             ] ->
               return ()
           _ -> assertFailure $ "Expected projection on record literal, got: " ++ show contract
+
+  , testCase "Typed lambda expression and application" $
+      parseSuccess "contract Test { storage: {}; @entrypoint apply(): int { return ((x: int) => x + 1)(5); } }" $ \contract ->
+        case contract of
+          Contract _ _
+            [ MethodDecl _ "apply" [] TInt
+                (SequenceStmt
+                  [ ReturnStmt
+                      (App _ (Lambda _ "x" TInt (Add _ (Var _ "x") (CInt _ 1))) (CInt _ 5))
+                  ])
+            ] -> return ()
+          _ -> assertFailure $ "Expected lambda application, got: " ++ show contract
   ]
 
 statementTests :: TestTree
@@ -473,6 +518,86 @@ typeCheckTests =
               Right (ContractInstance _ st) -> case st of
                 Record _ [("n", CInt _ 1), ("b", CBool _ True)] -> return ()
                 _ -> assertFailure $ "unexpected storage expr: " ++ show st
+    , testCase "Lambda application has its result type" $
+        typeCheckSuccess
+          "contract C { storage: {}; @entrypoint apply(): int { return ((x: int) => x + 1)(5); } }"
+    , testCase "Lambda can be stored using a function type" $
+        typeCheckSuccess
+          "contract C { storage: {}; @entrypoint apply(): int { val inc: int -> int = (x: int) => x + 1; return (inc)(5); } }"
+    , testCase "Function application rejects an argument of the wrong type" $
+        typeCheckFailure
+          "contract C { storage: {}; @entrypoint apply(): int { return ((x: int) => x + 1)(true); } }"
+    , testCase "View can read storage" $
+        typeCheckSuccess
+          "contract C { storage: { n: int }; @view getN(): int { return storage.n; } }"
+    , testCase "View cannot assign to storage" $
+        typeCheckFailure
+          "contract C { storage: { n: int }; @view bad(): unit { storage.n = 1; return (); } }"
+    ]
+
+interpreterTests :: TestTree
+interpreterTests =
+  testGroup
+    "Interpreter"
+    [ testCase "Lambda application evaluates to 6" $
+        case
+          runEntrypointReturn
+            "contract C { storage: {}; @entrypoint apply(): int { return ((x: int) => x + 1)(5); } }"
+            "apply"
+            (Record (TRecord []) [])
+        of
+          Right (CInt _ 6) -> return ()
+          other -> assertFailure $ "Expected 6, got: " ++ show other
+    , testCase "Closure captures a surrounding immutable value" $
+        case
+          runEntrypointReturn
+            "contract C { storage: {}; @entrypoint apply(): int { val offset: int = 10; return ((x: int) => x + offset)(5); } }"
+            "apply"
+            (Record (TRecord []) [])
+        of
+          Right (CInt _ 15) -> return ()
+          other -> assertFailure $ "Expected 15, got: " ++ show other
+    , testCase "View returns a value without changing repository state" $
+        let source =
+              "contract C { storage: { n: int }; @originate init(initialN: int): unit { storage = { n: initialN }; return (); } @view nextN(): int { return ((x: int) => x + 1)(storage.n); } }"
+         in case parseAndTypeCheck source of
+              Left err -> assertFailure $ "Compile failed: " ++ err
+              Right contract ->
+                case originateWithJsonArgs mempty contract source (object ["initialN" .= (7 :: Int)]) of
+                  Left err -> assertFailure $ "Origination failed: " ++ err
+                  Right (address, repository) ->
+                    case callViewWithJsonArgs repository contract address "nextN" source (object []) of
+                      Right (Just (CInt _ 8), repository') ->
+                        assertEqual "A view must preserve the repository" repository repository'
+                      other -> assertFailure $ "Expected view result 8, got: " ++ show other
+    ]
+
+codeGenTests :: TestTree
+codeGenTests =
+  testGroup
+    "LLTZ code generation"
+    [ testCase "Function type translates to LLTZ" $
+        translateType (TFunction TInt TBool)
+          @?= LLTZ.TFunction LLTZ.TInt LLTZ.TBool
+    , testCase "Lambda translates to an LLTZ lambda binder" $
+        let sourceExpr = Lambda (TFunction TInt TInt) "x" TInt (Var TInt "x")
+            expected =
+              LLTZ.Expr
+                ( LLTZ.Lambda
+                    ( LLTZ.LambdaBinder
+                        (LLTZ.Var "x", LLTZ.TInt)
+                        (LLTZ.Expr (LLTZ.Variable (LLTZ.Var "x")) LLTZ.TInt)
+                    )
+                )
+                (LLTZ.TFunction LLTZ.TInt LLTZ.TInt)
+         in translateExpression sourceExpr @?= expected
+    , testCase "Application translates to LLTZ App" $
+        let function = Lambda (TFunction TInt TInt) "x" TInt (Var TInt "x")
+            sourceExpr = App TInt function (CInt TInt 5)
+         in case translateExpression sourceExpr of
+              LLTZ.Expr (LLTZ.App _ (LLTZ.Expr (LLTZ.Const (LLTZ.CInt 5)) LLTZ.TInt)) LLTZ.TInt ->
+                return ()
+              other -> assertFailure $ "Expected LLTZ App, got: " ++ show other
     ]
 
 errorTests :: TestTree
@@ -501,4 +626,7 @@ errorTests = testGroup "Error Cases"
 
   , testCase "Invalid expression syntax" $
       parseFailure "contract Test { storage: { x: int }; @entrypoint test(): int { return +; } }"
+
+  , testCase "Lambda parameter requires a type" $
+      parseFailure "contract Test { storage: {}; @entrypoint test(): int { return ((x) => x)(1); } }"
   ]
