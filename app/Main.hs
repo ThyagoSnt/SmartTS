@@ -29,6 +29,12 @@ data CliCmd
       , cmdEntrypoint :: String
       , cmdArgsJson :: String
       }
+  | CmdView
+      { cmdRepo :: FilePath
+      , cmdAddress :: String
+      , cmdViewName :: String
+      , cmdArgsJson :: String
+      }
 
 data PersistedInstance = PersistedInstance
   { persistedContractName :: String
@@ -67,16 +73,16 @@ main = do
   case cmd of
     CmdOriginate r s a -> runOriginate r s a
     CmdCall r addr ep a -> runCall r addr ep a
+    CmdView r addr viewName a -> runView r addr viewName a
 
 parseCliOptions :: [String] -> IO CliCmd
 parseCliOptions args = do
   let hasOriginate = "--originate" `elem` args
       hasCall = "--call" `elem` args
+      hasView = "--view" `elem` args
   repoDir <- lookupFlagValue "--repo" args
-  case (hasOriginate, hasCall) of
-    (True, True) ->
-      die "Use either --originate or --call, not both."
-    (True, False) -> do
+  case (hasOriginate, hasCall, hasView) of
+    (True, False, False) -> do
       sourcePath <- lookupFlagValue "--source" args
       argsJson <- lookupFlagValue "--args" args
       case (repoDir, sourcePath, argsJson) of
@@ -88,7 +94,7 @@ parseCliOptions args = do
               [ "Usage (originate):"
               , "  smart-ts --originate --repo <dir> --source <contract.smartts> --args '{\"x\":1}'"
               ]
-    (False, True) -> do
+    (False, True, False) -> do
       addr <- lookupFlagValue "--address" args
       ep <- lookupFlagValue "--entrypoint" args
       argsJson <- lookupFlagValue "--args" args
@@ -101,19 +107,51 @@ parseCliOptions args = do
               [ "Usage (call):"
               , "  smart-ts --call --repo <dir> --address <KT1...> --entrypoint <name> --args '{\"n\":1}'"
               ]
-    (False, False) ->
+    (False, False, True) -> do
+      addr <- lookupFlagValue "--address" args
+      viewName <- lookupViewName args
+      argsJson <- lookupFlagValue "--args" args
+      case (repoDir, addr, viewName, argsJson) of
+        (Just r, Just ad, Just v, Just a) ->
+          pure (CmdView r ad v a)
+        _ ->
+          die $
+            unlines
+              [ "Usage (view):"
+              , "  smart-ts --view <name> --repo <dir> --address <KT1...> --args '{}'"
+              , "  smart-ts --view --repo <dir> --address <KT1...> --view <name> --args '{}'"
+              ]
+    (False, False, False) ->
       die $
         unlines
           [ "Usage:"
           , "  smart-ts --originate --repo <dir> --source <contract.smartts> --args '{\"x\":1}'"
           , "  smart-ts --call --repo <dir> --address <KT1...> --entrypoint <name> --args '{}'"
+          , "  smart-ts --view <name> --repo <dir> --address <KT1...> --args '{}'"
           ]
+    _ ->
+      die "Use exactly one of --originate, --call, or --view."
 
 lookupFlagValue :: String -> [String] -> IO (Maybe String)
 lookupFlagValue flag args =
   case dropWhile (/= flag) args of
     (_ : value : _) -> pure (Just value)
     _ -> pure Nothing
+
+-- | Find the last non-option operand attached to @--view@.  Accepting the last
+-- occurrence supports both @--view getCount@ and the spelling from the project
+-- plan, @--view ... --view getCount@, without mistaking @--repo@ for a name.
+lookupViewName :: [String] -> IO (Maybe String)
+lookupViewName = pure . go Nothing
+  where
+    go found ("--view" : value : rest)
+      | not (isOption value) = go (Just value) rest
+      | otherwise = go found (value : rest)
+    go found (_ : rest) = go found rest
+    go found [] = found
+
+    isOption ('-' : '-' : _) = True
+    isOption _ = False
 
 runOriginate :: FilePath -> FilePath -> String -> IO ()
 runOriginate repoDir sourcePath argsJsonStr = do
@@ -197,6 +235,59 @@ runCall repoDir address entrypoint argsJsonStr = do
       case maybeRet of
         Nothing -> putStrLn "Call completed."
         Just v -> BL.putStr (encode (exprToJson v) `BL.snoc` 10)
+
+runView :: FilePath -> String -> String -> String -> IO ()
+runView repoDir address viewName argsJsonStr = do
+  persisted <- loadState repoDir
+  es <- resolveRepositoryState repoDir persisted
+  repoState <- case es of
+    Left err -> die ("Repository state: " ++ err)
+    Right ok -> pure ok
+  ci <-
+    case M.lookup address repoState of
+      Nothing -> die ("Unknown address: " ++ address)
+      Just x -> pure x
+
+  let contractPath =
+        repoDir </> "contracts" </> instanceContractName ci ++ ".smartts"
+  contractFileExists <- doesFileExist contractPath
+  if not contractFileExists
+    then
+      die
+        ( "Contract source not found: "
+            ++ contractPath
+            ++ " (originate the contract into this repo first)."
+        )
+    else do
+      source <- readFile contractPath
+      parsed <-
+        case parseContractFromString source of
+          Left e  -> die ("Parse error: " ++ show e)
+          Right c -> pure c
+      contract <-
+        case typeCheckContract parsed of
+          Left err -> die ("Type error: " ++ err)
+          Right c  -> pure c
+
+      argsValue <-
+        case eitherDecode (BL.fromStrict (toStrictUtf8 argsJsonStr)) of
+          Left e -> die ("Invalid JSON for --args: " ++ e)
+          Right v -> pure v
+
+      (maybeRet, repoState') <-
+        case callViewWithJsonArgs repoState contract address viewName source argsValue of
+          Left e -> die ("View failed: " ++ e)
+          Right ok -> pure ok
+
+      -- A view is deliberately read-only: unlike runCall, this path never
+      -- writes state.json.  The equality check is a defensive guard around the
+      -- interpreter API's non-persistence contract.
+      if repoState' /= repoState
+        then die "View failed: read-only invocation unexpectedly changed repository state."
+        else
+          case maybeRet of
+            Nothing -> putStrLn "View completed."
+            Just v -> BL.putStr (encode (exprToJson v) `BL.snoc` 10)
 
 toPersistedState :: RepositoryState -> PersistedState
 toPersistedState repo =

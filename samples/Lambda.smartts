@@ -1,0 +1,23 @@
+contract LambdaView {
+  storage: {
+    count: int
+  };
+
+  @originate
+  init(initialCount: int): unit {
+    storage.count = initialCount;
+    return ();
+  }
+
+  @entrypoint
+  setCount(value: int): unit {
+    storage.count = value;
+    return ();
+  }
+
+  @view
+  incremented(by: int): int {
+    val add: int -> int = (value: int) => value + by;
+    return (add)(storage.count);
+  }
+}

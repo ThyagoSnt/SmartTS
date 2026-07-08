@@ -10,6 +10,8 @@ translateType A.TUnit            = L.TUnit
 translateType (A.TRecord fields) = L.TTuple (L.RowNode (map toLeaf fields))
   where
     toLeaf (name, ty) = L.RowLeaf (Just (L.Label name)) (translateType ty)
+translateType (A.TFunction argument result) =
+  L.TFunction (translateType argument) (translateType result)
 
 -- Basic Expressions
 translateExpression :: A.TypedExpr -> L.Expr
@@ -20,6 +22,26 @@ translateExpression (A.Var   ty name)  = mkExpr (L.Variable (L.Var name)) ty
 translateExpression (A.And ty e1 e2) = translateBinaryExpression e1 e2 ty L.PrimAnd
 translateExpression (A.Or  ty e1 e2) = translateBinaryExpression e1 e2 ty L.PrimOr
 translateExpression (A.Not ty e)     = translateUnaryExpression e ty L.PrimNot
+-- First-class functions lower directly to the corresponding LLTZ nodes.  A
+-- SmartTS lambda already carries the inferred function type in its annotation,
+-- while the binder keeps the source-level parameter type.
+translateExpression (A.Lambda ty parameter parameterType body) =
+  mkExpr
+    ( L.Lambda
+        ( L.LambdaBinder
+            (L.Var parameter, translateType parameterType)
+            (translateExpression body)
+        )
+    )
+    ty
+translateExpression (A.App ty function argument) =
+  mkExpr
+    (L.App (translateExpression function) (translateExpression argument))
+    ty
+-- Closures are interpreter-only runtime values.  They cannot occur in the
+-- typed source AST handed to code generation.
+translateExpression (A.Closure _ _ _ _ _) =
+  error "SmartTS code generation: runtime closures cannot be translated to LLTZ."
 -- TODO: Write here the translation of the remaining expressions.
 
 -- | Translate a SmartTS block (a list of statements) into a nested LLTZ let-expression.
